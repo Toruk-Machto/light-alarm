@@ -25,6 +25,7 @@ public final class AlarmReceiver extends BroadcastReceiver {
         } else if (!PRUNE.equals(action)) {
             data.tick(now);
         }
+        if (data.ringing.isEmpty()) AlarmVolume.restoreIfUnused(context);
         data.purge(now);
         data.save();
         schedule(context, data);
@@ -38,7 +39,7 @@ public final class AlarmReceiver extends BroadcastReceiver {
         mgr.cancel(expire);
         mgr.cancel(prune);
         long at = Long.MAX_VALUE, end = Long.MAX_VALUE, oldest = Long.MAX_VALUE;
-        for (AlarmStore.Event e : data.pending) at = Math.min(at, e.at());
+        for (AlarmStore.Event e : data.pending) at = Math.min(at, data.dueAt(e, System.currentTimeMillis(), SystemClock.elapsedRealtime()));
         for (AlarmStore.Event e : data.ringing) end = Math.min(end, e.elapsedDeadline());
         for (AlarmStore.Log log : data.history) oldest = Math.min(oldest, log.at());
         if (mgr.canScheduleExactAlarms()) {

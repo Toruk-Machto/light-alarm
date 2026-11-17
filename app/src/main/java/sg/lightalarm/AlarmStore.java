@@ -12,7 +12,7 @@ import java.util.UUID;
 
 final class AlarmStore {
     static final long MIN = 60_000L, DAY = 24 * 60 * MIN;
-    static final int MAIN = 0, PRE = 1, SNOOZE = 2, RETRY = 3, BACKUP = 4;
+    static final int MAIN = 0, PRE = 1, SNOOZE = 2, RETRY = 3, BACKUP = 4; // 3/4 read legacy saved events only
     static final int TAP = 0, HOLD = 1, SLIDE = 2;
     final ArrayList<Alarm> alarms = new ArrayList<>();
     final ArrayList<Event> pending = new ArrayList<>(), ringing = new ArrayList<>();
@@ -23,8 +23,9 @@ final class AlarmStore {
     static final class Alarm {
         String id = UUID.randomUUID().toString(), label = "", note = "";
         boolean enabled = true, reminder, hide;
-        int tone = 1, vibration = 1, fade = 0, pre = 0, snooze = 5, limit = 3;
-        int dismiss = HOLD, seconds = 120, retry = 0, backup = 0;
+        int tone = 1, vibration = 1, fade = 0, pre = 0, followupGap = 5, followupCount = 3;
+        int seconds = 120, volume = 100;
+        boolean repeatUnanswered = true, reviewFollowups;
         final Schedule schedule = new Schedule();
 
         String title() { return label.isBlank() ? (reminder ? "Reminder" : "Alarm") : label; }
@@ -39,9 +40,20 @@ final class AlarmStore {
             a.hide = obj.optBoolean("hide");
             a.tone = obj.optInt("tone", 1); a.vibration = obj.optInt("vibration", 1);
             a.fade = obj.optInt("fade"); a.pre = obj.optInt("pre");
-            a.snooze = obj.optInt("snooze", 5); a.limit = obj.optInt("limit", 3);
-            a.dismiss = obj.optInt("dismiss", HOLD); a.seconds = obj.optInt("seconds", 120);
-            a.retry = obj.optInt("retry"); a.backup = obj.optInt("backup");
+            a.seconds = obj.optInt("seconds", 120);
+            a.volume = Math.max(10, Math.min(100, obj.optInt("volume", 100)));
+            boolean old = !obj.has("followupCount");
+            int oldGap = obj.optInt("snooze", 5), oldCount = obj.optInt("limit", 3);
+            int retry = obj.optInt("retry"), backup = obj.optInt("backup");
+            a.followupGap = Math.max(1, Math.min(60, obj.optInt("followupGap", oldGap > 0 ? oldGap : 5)));
+            a.followupCount = Math.max(0, Math.min(15, obj.optInt("followupCount", oldGap > 0 ? oldCount : 0)));
+            a.repeatUnanswered = obj.optBoolean("repeatUnanswered", old && (retry > 0 || backup > 0));
+            a.reviewFollowups = obj.optBoolean("reviewFollowups", old && (retry > 0 || backup > 0));
+            if (old && a.reviewFollowups) {
+                if (a.followupCount == 0) a.followupCount = 1;
+                if (oldGap <= 0) a.followupGap = Math.max(1, Math.min(60, retry > 0 ? retry : backup));
+            }
+            if (old) a.followupGap = Math.max(a.followupGap, (a.seconds + 59) / 60);
             Schedule s = a.schedule;
             s.kind = obj.optInt("kind");
             s.minute = obj.optInt("minute", 420);
@@ -63,8 +75,9 @@ final class AlarmStore {
             for (int time : s.week) days.put(time);
             return object("id", id, "label", label, "note", note, "enabled", enabled,
                     "reminder", reminder, "hide", hide, "tone", tone, "vibration", vibration,
-                    "fade", fade, "pre", pre, "snooze", snooze, "limit", limit, "dismiss", dismiss,
-                    "seconds", seconds, "retry", retry, "backup", backup, "kind", s.kind,
+                    "fade", fade, "pre", pre, "followupGap", followupGap, "followupCount", followupCount,
+                    "seconds", seconds, "volume", volume, "repeatUnanswered", repeatUnanswered,
+                    "reviewFollowups", reviewFollowups, "kind", s.kind,
                     "minute", s.minute, "monthDay", s.monthDay, "ordinal", s.ordinal,
                     "weekday", s.weekday, "date", s.date, "end", s.end, "zone", s.zone,
                     "lastDay", s.lastDay, "week", days);
@@ -72,7 +85,11 @@ final class AlarmStore {
     }
 
     record Event(String alarm, int type, long at, long group, String day, int snoozes,
-                 long deadline, boolean retried, long elapsedDeadline, int bootCount) {
+                 long deadline, boolean retried, long elapsedDeadline, int bootCount, long elapsedAt) {
+        Event(String alarm, int type, long at, long group, String day, int snoozes,
+              long deadline, boolean retried, long elapsedDeadline, int bootCount) {
+            this(alarm, type, at, group, day, snoozes, deadline, retried, elapsedDeadline, bootCount, 0);
+        }
         Event(String alarm, int type, long at, long group, String day, int snoozes,
               long deadline, boolean retried) {
             this(alarm, type, at, group, day, snoozes, deadline, retried, 0, -1);
@@ -81,27 +98,27 @@ final class AlarmStore {
             return new Event(alarm, phase, time, group, day, count, 0, wasRetried);
         }
         Event active(long deadline, long elapsedDeadline, int bootCount, int count, boolean wasRetried) {
-            return new Event(alarm, type, at, group, day, count, deadline, wasRetried, elapsedDeadline, bootCount);
+            return new Event(alarm, type, at, group, day, count, deadline, wasRetried, elapsedDeadline, bootCount, elapsedAt);
         }
         static Event from(JSONObject o) {
             return new Event(o.optString("alarm"), o.optInt("type"), o.optLong("at"),
                     o.optLong("group"), o.optString("day"), o.optInt("snoozes"),
                     o.optLong("deadline"), o.optBoolean("retried"),
-                    o.optLong("elapsedDeadline"), o.optInt("bootCount", -1));
+                    o.optLong("elapsedDeadline"), o.optInt("bootCount", -1), o.optLong("elapsedAt"));
         }
         JSONObject json() {
             return object("alarm", alarm, "type", type, "at", at, "group", group,
                     "day", day, "snoozes", snoozes, "deadline", deadline, "retried", retried,
-                    "elapsedDeadline", elapsedDeadline, "bootCount", bootCount);
+                    "elapsedDeadline", elapsedDeadline, "bootCount", bootCount, "elapsedAt", elapsedAt);
         }
         boolean same(Event event) { return alarm.equals(event.alarm) && group == event.group; }
         String key() { return alarm + "/" + group + "/" + type + "/" + at; }
         String phase() {
             return switch (type) {
                 case PRE -> "Gentle pre-alarm";
-                case SNOOZE -> "Snoozed alarm";
-                case RETRY -> "Retry";
-                case BACKUP -> "Backup alarm";
+                case SNOOZE -> "Follow-up " + snoozes;
+                case RETRY -> "Follow-up (previous version)";
+                case BACKUP -> "Follow-up (previous version)";
                 default -> "";
             };
         }
@@ -175,7 +192,29 @@ final class AlarmStore {
             pending.add(new Event(alarm.id, PRE, pre, at, next.day(), 0, 0, false));
     }
 
+    long dueAt(Event e, long now, long elapsedNow) {
+        return e.elapsedAt > 0 && e.bootCount == bootCount ? now + e.elapsedAt - elapsedNow : e.at;
+    }
+
+    private void followups(Alarm alarm, Event source, long now, long elapsedNow) {
+        pending.removeIf(e -> e.same(source) && e.type != MAIN && e.type != PRE);
+        for (int number = source.snoozes + 1; number <= alarm.followupCount; number++) {
+            long gap = (number - source.snoozes) * alarm.followupGap * MIN;
+            pending.add(new Event(alarm.id, SNOOZE, now + gap, source.group, source.day,
+                    number, 0, true, 0, bootCount, elapsedNow + gap));
+        }
+    }
+
     void recover(long now, boolean boot, boolean wallChanged) {
+        long elapsed = SystemClock.elapsedRealtime();
+        // Keep follow-up intervals stable across clock changes and process restarts.
+        for (int i = 0; i < pending.size(); i++) {
+            Event e = pending.get(i);
+            if (e.type == MAIN || e.type == PRE) continue;
+            long at = dueAt(e, now, elapsed);
+            pending.set(i, new Event(e.alarm, e.type, at, e.group, e.day, e.snoozes,
+                    0, e.retried, 0, bootCount, elapsed + at - now));
+        }
         if (boot) {
             for (Event e : ringing) log(e, "Missed", now);
             ringing.clear();
@@ -199,24 +238,23 @@ final class AlarmStore {
             ringing.remove(ring);
             if (ring.type == PRE) continue;
             log(ring, "Missed", now);
-            Alarm a = find(ring.alarm);
-            if (a != null && a.retry > 0 && !ring.retried && ring.type != BACKUP)
-                pending.add(ring.move(RETRY, now + a.retry * MIN, ring.snoozes, true));
+            // The complete sequence is already scheduled, so expiry needs no retry wake lock.
         }
-        pending.sort(Comparator.comparingLong(Event::at));
+        pending.sort(Comparator.comparingLong(e -> dueAt(e, now, elapsedNow)));
         for (Event e : new ArrayList<>(pending)) {
-            if (e.at > now) break;
+            long due = dueAt(e, now, elapsedNow);
+            if (due > now) break;
             if (!pending.remove(e)) continue;
             Alarm a = find(e.alarm);
             if (a == null) continue;
             if (e.type == MAIN) {
                 a.schedule.lastDay = e.day;
-                if (a.backup > 0 && e.at + a.backup * MIN > now)
-                    pending.add(e.move(BACKUP, e.at + a.backup * MIN, 0, false));
+                if (a.repeatUnanswered && a.followupCount > 0 && now - due <= 2 * MIN)
+                    followups(a, e, now, elapsedNow);
                 plan(a, now);
             }
             if (e.type == PRE && (now >= e.group || now - e.at > 30_000)) continue;
-            if (e.type != PRE && now - e.at > 2 * MIN) { log(e, "Missed", now); continue; }
+            if (e.type != PRE && now - due > 2 * MIN) { log(e, "Missed", now); continue; }
             int snoozes = e.snoozes;
             boolean retried = e.retried;
             for (Event old : ringing) {
@@ -224,31 +262,28 @@ final class AlarmStore {
                 snoozes = Math.max(snoozes, old.snoozes);
                 retried |= old.retried;
             }
-            if (e.type == BACKUP || e.type == RETRY) {
-                for (Event scheduled : pending) {
-                    if (!scheduled.same(e)) continue;
-                    snoozes = Math.max(snoozes, scheduled.snoozes);
-                    retried |= scheduled.retried;
-                }
-                pending.removeIf(x -> x.same(e) && (x.type == RETRY || x.type == SNOOZE));
-            }
             ringing.removeIf(x -> x.same(e));
             long duration = (e.type == PRE ? 8 : a.seconds) * 1000L;
-            ringing.add(e.active(now + duration, elapsedNow + duration, bootCount, snoozes, retried));
+            Event shown = new Event(e.alarm, e.type, due, e.group, e.day, snoozes, 0, retried);
+            ringing.add(shown.active(now + duration, elapsedNow + duration, bootCount, snoozes, retried));
             log(e, "Rang", now);
         }
     }
 
     void respond(String key, String action, long now) {
+        respond(key, action, now, SystemClock.elapsedRealtime());
+    }
+
+    void respond(String key, String action, long now, long elapsedNow) {
         for (Event e : new ArrayList<>(ringing)) {
             Alarm a = find(e.alarm);
             if (a == null || !e.key().equals(key)) continue;
             boolean snooze = action.equals("snooze");
-            if (snooze && (e.type == PRE || e.snoozes >= a.limit || a.snooze <= 0)) return;
+            if (snooze && (e.type == PRE || e.snoozes >= a.followupCount || a.followupGap <= 0)) return;
             ringing.remove(e);
             if (e.type != PRE) {
-                pending.removeIf(p -> p.same(e) && (!snooze || p.type != BACKUP));
-                if (snooze) pending.add(e.move(SNOOZE, now + a.snooze * MIN, e.snoozes + 1, e.retried));
+                pending.removeIf(p -> p.same(e));
+                if (snooze) followups(a, e, now, elapsedNow);
             }
             log(e, snooze ? "Snoozed" : action.equals("skip") ? "Skipped" :
                     a.reminder ? "Done" : "Dismissed", now);

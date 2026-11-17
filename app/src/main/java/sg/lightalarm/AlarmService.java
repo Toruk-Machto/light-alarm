@@ -13,6 +13,7 @@ public final class AlarmService extends Service {
     private final Tone tone = new Tone();
     private PowerManager.WakeLock wake;
     private String playing = "";
+    private AlarmVolume volume;
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
@@ -25,6 +26,7 @@ public final class AlarmService extends Service {
                 .comparingInt((AlarmStore.Event e) -> e.type() == AlarmStore.PRE ? 1 : 0)
                 .thenComparingLong(AlarmStore.Event::at)).orElse(null);
         if (event == null) {
+            AlarmVolume.restoreIfUnused(this);
             stopSelf(startId);
             return START_NOT_STICKY;
         }
@@ -43,6 +45,9 @@ public final class AlarmService extends Service {
             playing = event.key();
             long duration = (event.type() == AlarmStore.PRE ? 8 : alarm.seconds) * 1000L;
             long elapsed = Math.max(0, duration - (event.elapsedDeadline() - SystemClock.elapsedRealtime()));
+            if (volume == null) volume = new AlarmVolume(this);
+            if (alarm.tone > 0) volume.apply(alarm.volume);
+            else volume.close();
             tone.play(alarm.tone, event.type() == AlarmStore.PRE ? 14 : alarm.fade,
                     elapsed);
             Vibrator vibrator = getSystemService(VibratorManager.class).getDefaultVibrator();
@@ -56,11 +61,7 @@ public final class AlarmService extends Service {
         if (wake == null) wake = AlarmReceiver.wake(this);
         if (wake.isHeld()) wake.release();
         // Audio needs the CPU, while the vibrator runs its finite waveform in the system.
-        boolean needsRetry = data.ringing.stream().anyMatch(e -> {
-            AlarmStore.Alarm owner = data.find(e.alarm());
-            return owner != null && owner.retry > 0 && !e.retried() && e.type() != AlarmStore.BACKUP;
-        });
-        if (alarm.tone > 0 || needsRetry) wake.acquire(Math.max(1000, delay + 5000));
+        if (alarm.tone > 0) wake.acquire(Math.max(1000, delay + 5000));
         handler.removeCallbacksAndMessages(null);
         handler.postDelayed(() -> {
             AlarmStore live = new AlarmStore(this);
@@ -83,25 +84,15 @@ public final class AlarmService extends Service {
                         event.phase().isEmpty() ? "Alarm ringing" : event.phase())
                 .setContentIntent(show).setOngoing(true).setOnlyAlertOnce(!changed);
         if (event.type() != AlarmStore.PRE) builder.setFullScreenIntent(show, true);
-        if (event.type() != AlarmStore.PRE && alarm.snooze > 0 && event.snoozes() < alarm.limit)
-            builder.addAction(new Notification.Action.Builder(null, alarm.reminder ? "Later" : "Snooze",
-                    action(event, "snooze")).build());
-        if (event.type() == AlarmStore.PRE || alarm.dismiss == AlarmStore.TAP)
-            builder.addAction(new Notification.Action.Builder(null, alarm.reminder ? "Done" : "Dismiss",
-                    action(event, "dismiss")).build());
+        // Notification actions open the protected controls instead of bypassing the hold.
+        builder.addAction(new Notification.Action.Builder(null, "Open alarm", show).build());
         return builder.build();
-    }
-
-    private PendingIntent action(AlarmStore.Event event, String response) {
-        Intent intent = new Intent(this, AlarmReceiver.class).setAction(AlarmReceiver.CHANGE)
-                .setData(android.net.Uri.parse("lightalarm://respond/" + event.key() + "/" + response))
-                .putExtra("key", event.key()).putExtra("response", response);
-        return PendingIntent.getBroadcast(this, 18, intent, PendingIntent.FLAG_IMMUTABLE);
     }
 
     @Override public void onDestroy() {
         handler.removeCallbacksAndMessages(null);
         tone.close();
+        if (volume != null) volume.close();
         getSystemService(VibratorManager.class).getDefaultVibrator().cancel();
         if (wake != null && wake.isHeld()) wake.release();
         stopForeground(STOP_FOREGROUND_REMOVE);

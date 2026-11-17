@@ -10,6 +10,25 @@ final class Schedule {
     String date = LocalDate.now().plusDays(1).toString(), end = "", zone = "", lastDay = "";
     final int[] week = {420, 420, 420, 420, 420, -1, -1};
 
+    void sharedTime(int value) {
+        minute = value;
+        for (int i = 0; i < week.length; i++) if (week[i] >= 0) week[i] = value;
+    }
+
+    boolean mixedWeekTimes() {
+        int first = -1;
+        for (int value : week) if (value >= 0) {
+            if (first >= 0 && value != first) return true;
+            first = value;
+        }
+        return false;
+    }
+
+    int selectedWeekTime() {
+        for (int value : week) if (value >= 0) return value;
+        return minute;
+    }
+
     ZoneId zone(ZoneId current) {
         return zone.isEmpty() ? current : ZoneId.of(zone);
     }

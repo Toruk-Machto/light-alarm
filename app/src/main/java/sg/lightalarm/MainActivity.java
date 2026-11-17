@@ -18,9 +18,12 @@ import java.util.function.IntConsumer;
 public final class MainActivity extends Page {
     private static final String[] DAYS = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"};
     private static final String[] RULES = {"One time", "Selected weekdays", "Monthly by date", "Monthly by weekday"};
-    private static final String[] DISMISS = {"Tap", "Hold", "Slide"};
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Tone preview = new Tone();
+    private AlarmVolume previewVolume;
+    private boolean previewPlaying;
+    private Runnable previewStop;
+    private TextView previewButton;
     private String screen = "home";
     private AlarmStore.Alarm editing;
     private boolean existing;
@@ -43,6 +46,7 @@ public final class MainActivity extends Page {
         super.onCreate(state);
         setVolumeControlStream(android.media.AudioManager.STREAM_ALARM);
         AlarmStore data = new AlarmStore(this);
+        if (data.ringing.isEmpty()) AlarmVolume.restoreIfUnused(this);
         boolean changed = false;
         long now = System.currentTimeMillis();
         for (AlarmStore.Alarm a : data.alarms) {
@@ -67,7 +71,7 @@ public final class MainActivity extends Page {
         handler.removeCallbacks(refresh);
         refresh.run();
     }
-    @Override protected void onPause() { preview.close(); handler.removeCallbacksAndMessages(null); super.onPause(); }
+    @Override protected void onPause() { stopPreview(); handler.removeCallbacksAndMessages(null); super.onPause(); }
 
     @Override public void onBackPressed() {
         if (screen.equals("home")) super.onBackPressed();
@@ -183,7 +187,6 @@ public final class MainActivity extends Page {
         editing.schedule.minute = start.getHour() * 60 + start.getMinute();
         for (int i = 0; i < 5; i++) editing.schedule.week[i] = editing.schedule.minute;
         if (reminder) {
-            editing.dismiss = AlarmStore.TAP;
             editing.tone = 0;
             editing.seconds = 30;
         }
@@ -192,6 +195,7 @@ public final class MainActivity extends Page {
     }
 
     private void editor() {
+        stopPreview();
         screen = "editor";
         page(existing ? "Edit " + noun() : "New " + noun(), "Save", this::home, this::save);
         label(root, "Label");
@@ -206,17 +210,13 @@ public final class MainActivity extends Page {
         line(root, "Schedule", scheduleSummary(editing), this::schedulePage);
         line(root, "Sound and vibration", Tone.NAMES[editing.tone] + " · " +
                 (editing.vibration == 0 ? "No vibration" : Tone.PATTERNS[editing.vibration]), this::soundPage);
-        line(root, "Snooze, dismissal and backup",
-                (editing.snooze == 0 || editing.limit == 0 ? "Snooze off" : editing.snooze + " min snooze")
-                        + " · " + DISMISS[editing.dismiss] + " to dismiss", this::followupPage);
+        line(root, "Follow-ups", editing.followupCount == 0 ? "Off" : editing.followupCount
+                + " additional rings · " + editing.followupGap + " min apart", this::followupPage);
+        if (editing.reviewFollowups) note(root, "Earlier retry and backup settings were combined. Review Follow-ups before saving.");
         Schedule.Next next = previewNext();
         if (next != null) {
             gap(root, 5);
             note(root, (editing.enabled ? "Next · " : "If enabled · ") + day(next.at()) + " at " + time(next.at()));
-            if (editing.backup > 0) {
-                long backup = next.at() + editing.backup * AlarmStore.MIN;
-                note(root, "Backup · " + day(backup) + " at " + time(backup));
-            }
         }
         if (existing) {
             gap(root, 12);
@@ -237,44 +237,48 @@ public final class MainActivity extends Page {
         page("Schedule", null, this::editor, null);
         Schedule s = editing.schedule;
         choice(root, "Repeat", RULES, s.kind, i -> {
+            if (i == Schedule.WEEK && s.kind != Schedule.WEEK) s.sharedTime(s.minute);
             s.kind = i;
             schedulePage();
         });
         if (s.kind == Schedule.ONCE) line(root, "Date", dateFormat(LocalDate.parse(s.date)),
                 () -> pickDate(s.date, value -> { s.date = value; schedulePage(); }));
-        if (s.kind != Schedule.WEEK) line(root, "Time", minutes(s.minute),
-                () -> pickTime(s.minute, value -> { s.minute = value; schedulePage(); }));
+        line(root, s.kind == Schedule.WEEK ? "Time for selected days" : "Time",
+                s.kind == Schedule.WEEK && s.mixedWeekTimes() ? "Different saved times · choose one shared time"
+                        : minutes(s.kind == Schedule.WEEK ? s.selectedWeekTime() : s.minute),
+                () -> pickTime(s.kind == Schedule.WEEK ? s.selectedWeekTime() : s.minute,
+                        value -> { s.sharedTime(value); schedulePage(); }));
         if (s.kind == Schedule.WEEK) {
+            label(root, "Days");
+            for (int rowStart = 0; rowStart < 7; rowStart += 4) {
+                LinearLayout days = row();
+                for (int d = rowStart; d < Math.min(7, rowStart + 4); d++) {
+                    int idx = d;
+                    TextView day = button(DAYS[d].substring(0, 3), s.week[d] >= 0, () -> {
+                        s.week[idx] = s.week[idx] >= 0 ? -1 : s.selectedWeekTime();
+                        schedulePage();
+                    });
+                    day.setContentDescription(DAYS[d] + (s.week[d] >= 0 ? " selected" : " not selected"));
+                    LinearLayout.LayoutParams cell = new LinearLayout.LayoutParams(0, dp(48), 1);
+                    if (d > rowStart) cell.leftMargin = dp(5);
+                    days.addView(day, cell);
+                }
+                root.addView(days);
+                gap(root, 6);
+            }
+            note(root, s.mixedWeekTimes() ? "Existing times are kept until you choose a shared time above."
+                    : "Selected days all use the time above.");
+            gap(root, 10);
             line(root, "Day presets", "Weekdays, weekends or every day", () -> new AlertDialog.Builder(this)
                     .setTitle("Enable days")
                     .setItems(new String[]{"Weekdays", "Weekends", "Every day"}, (dialog, index) -> {
+                        int shared = s.selectedWeekTime();
                         for (int i = 0; i < 7; i++) {
                             boolean included = index == 2 || (index == 0 ? i < 5 : i >= 5);
-                            s.week[i] = included ? (s.week[i] >= 0 ? s.week[i] : s.minute) : -1;
+                            s.week[i] = included ? (s.week[i] >= 0 ? s.week[i] : shared) : -1;
                         }
                         schedulePage();
                     }).show());
-            note(root, "Enable each day you want, then tap its time to change it.");
-            gap(root, 9);
-            for (int d = 0; d < 7; d++) {
-                int idx = d;
-                LinearLayout box = card(root);
-                LinearLayout entry = row();
-                Switch enabled = new Switch(this);
-                enabled.setText(DAYS[d]);
-                enabled.setMinHeight(dp(48));
-                enabled.setChecked(s.week[d] >= 0);
-                enabled.setOnCheckedChangeListener((view, on) -> { s.week[idx] = on ? s.minute : -1; schedulePage(); });
-                entry.addView(enabled, new LinearLayout.LayoutParams(0, -2, 1));
-                if (s.week[d] >= 0) {
-                    TextView t = button(minutes(s.week[d]), false,
-                            () -> pickTime(s.week[idx], value -> { s.week[idx] = value; schedulePage(); }));
-                    LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-2, -2);
-                    p.leftMargin = dp(9);
-                    entry.addView(t, p);
-                }
-                box.addView(entry);
-            }
         }
         if (s.kind == Schedule.MONTH_DAY) {
             number(root, "Day of the month", s.monthDay, 1, 31, "day", v -> { s.monthDay = v; schedulePage(); });
@@ -331,17 +335,39 @@ public final class MainActivity extends Page {
         list.requestFocus();
     }
 
+    private void stopPreview() {
+        if (previewStop != null) handler.removeCallbacks(previewStop);
+        previewStop = null;
+        preview.close();
+        if (previewVolume != null) previewVolume.close();
+        previewVolume = null;
+        previewPlaying = false;
+        if (previewButton != null) previewButton.setText("Preview tone");
+    }
+
     private void soundPage() {
+        stopPreview();
         screen = "ringing";
         page("Sound and vibration", null, this::editor, null);
         choice(root, "Tone", Tone.NAMES, editing.tone, i -> { preview.close(); editing.tone = i; soundPage(); });
-        root.addView(button("Preview tone", false, () -> {
-            if (editing.tone == 0) message("This alarm is set to silent.");
-            else {
-                preview.play(editing.tone, 0, 0);
-                handler.postDelayed(preview::close, 2800);
-            }
-        }));
+        previewButton = button("Preview tone", false, () -> {});
+        previewButton.setOnClickListener(v -> {
+            if (previewPlaying) { stopPreview(); previewButton.setText("Preview tone"); return; }
+            if (editing.tone == 0) { message("This alarm is set to silent."); return; }
+            if (!new AlarmStore(this).ringing.isEmpty()) { message("Finish the ringing alarm before previewing a tone."); return; }
+            previewVolume = new AlarmVolume(this);
+            if (!previewVolume.apply(editing.volume)) message("Phone settings may be blocking alarm volume.");
+            preview.play(editing.tone, 0, 0);
+            previewPlaying = true;
+            previewButton.setText("Stop preview");
+            previewStop = () -> { stopPreview(); previewButton.setText("Preview tone"); };
+            handler.postDelayed(previewStop, 8000);
+        });
+        root.addView(previewButton);
+        gap(root, 10);
+        number(root, "Alarm volume", editing.volume, 10, 100, "%", v -> { editing.volume = v; soundPage(); });
+        note(root, "Used while this alarm rings, even if the alarm volume was low. Previous volume is restored afterward. Do Not Disturb is respected.");
+        if (AlarmVolume.dndBlocksAlarms(this)) note(root, "Do Not Disturb currently blocks alarm sound.");
         gap(root, 10);
         choice(root, "Vibration", Tone.PATTERNS, editing.vibration, i -> {
             editing.vibration = i;
@@ -357,14 +383,20 @@ public final class MainActivity extends Page {
 
     private void followupPage() {
         screen = "followup";
-        page("Ringing controls", null, this::editor, null);
-        number(root, "Snooze length", editing.snooze, 0, 60, "min", v -> { editing.snooze = v; followupPage(); });
-        number(root, "Maximum snoozes", editing.limit, 0, 15, "times", v -> { editing.limit = v; followupPage(); });
-        choice(root, "Dismiss with", DISMISS, editing.dismiss, v -> { editing.dismiss = v; followupPage(); });
+        page("Follow-ups", null, this::editor, null);
+        if (editing.reviewFollowups) note(root, "Your earlier retry/backup settings were combined below. Choose the count and gap you want, then save the alarm.");
+        number(root, "Additional rings", editing.followupCount, 0, 15, "rings", v -> { editing.followupCount = v; followupPage(); });
+        number(root, "Time between rings", editing.followupGap, 1, 60, "min", v -> { editing.followupGap = v; followupPage(); });
+        Switch unanswered = new Switch(this);
+        unanswered.setText("Also repeat if unanswered");
+        unanswered.setChecked(editing.repeatUnanswered);
+        unanswered.setMinHeight(dp(52));
+        unanswered.setOnCheckedChangeListener((v, on) -> editing.repeatUnanswered = on);
+        root.addView(unanswered);
+        note(root, "One hold to snooze starts all remaining follow-ups. Snoozing again delays them without resetting the count. Hold to dismiss cancels them all for this occurrence.");
+        gap(root, 12);
         number(root, "Ring for", editing.seconds, 10, 600, "sec", v -> { editing.seconds = v; followupPage(); });
-        number(root, "Retry unanswered alarm", editing.retry, 0, 60, "min after ringing ends", v -> { editing.retry = v; followupPage(); });
-        number(root, "Backup alarm", editing.backup, 0, 120, "min after original time", v -> { editing.backup = v; followupPage(); });
-        note(root, "The backup is canceled when you dismiss the alarm. Snoozing keeps the backup armed.");
+        note(root, "Both Snooze and Dismiss need a 1.5-second hold. Release early to cancel.");
         gap(root, 8);
         Switch privacy = new Switch(this);
         privacy.setText("Hide label and note while locked");
@@ -408,7 +440,12 @@ public final class MainActivity extends Page {
             message("Enable notifications for a visual-only alarm, or choose a tone or vibration.");
             return;
         }
+        if (editing.followupCount > 0 && editing.followupGap * 60 < editing.seconds) {
+            message("The time between rings must be at least as long as Ring for.");
+            return;
+        }
         AlarmStore data = new AlarmStore(this);
+        editing.reviewFollowups = false;
         editing.schedule.lastDay = "";
         long now = System.currentTimeMillis();
         data.put(editing, now);
