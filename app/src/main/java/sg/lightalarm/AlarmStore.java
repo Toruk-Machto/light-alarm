@@ -2,6 +2,8 @@ package sg.lightalarm;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.os.SystemClock;
+import android.provider.Settings;
 import org.json.*;
 import java.time.ZoneId;
 import java.util.ArrayList;
@@ -16,6 +18,7 @@ final class AlarmStore {
     final ArrayList<Event> pending = new ArrayList<>(), ringing = new ArrayList<>();
     final ArrayList<Log> history = new ArrayList<>();
     private final SharedPreferences prefs;
+    final int bootCount;
 
     static final class Alarm {
         String id = UUID.randomUUID().toString(), label = "", note = "";
@@ -69,21 +72,27 @@ final class AlarmStore {
     }
 
     record Event(String alarm, int type, long at, long group, String day, int snoozes,
-                 long deadline, boolean retried) {
+                 long deadline, boolean retried, long elapsedDeadline, int bootCount) {
+        Event(String alarm, int type, long at, long group, String day, int snoozes,
+              long deadline, boolean retried) {
+            this(alarm, type, at, group, day, snoozes, deadline, retried, 0, -1);
+        }
         Event move(int phase, long time, int count, boolean wasRetried) {
             return new Event(alarm, phase, time, group, day, count, 0, wasRetried);
         }
-        Event active(long deadline, int count, boolean wasRetried) {
-            return new Event(alarm, type, at, group, day, count, deadline, wasRetried);
+        Event active(long deadline, long elapsedDeadline, int bootCount, int count, boolean wasRetried) {
+            return new Event(alarm, type, at, group, day, count, deadline, wasRetried, elapsedDeadline, bootCount);
         }
         static Event from(JSONObject o) {
             return new Event(o.optString("alarm"), o.optInt("type"), o.optLong("at"),
                     o.optLong("group"), o.optString("day"), o.optInt("snoozes"),
-                    o.optLong("deadline"), o.optBoolean("retried"));
+                    o.optLong("deadline"), o.optBoolean("retried"),
+                    o.optLong("elapsedDeadline"), o.optInt("bootCount", -1));
         }
         JSONObject json() {
             return object("alarm", alarm, "type", type, "at", at, "group", group,
-                    "day", day, "snoozes", snoozes, "deadline", deadline, "retried", retried);
+                    "day", day, "snoozes", snoozes, "deadline", deadline, "retried", retried,
+                    "elapsedDeadline", elapsedDeadline, "bootCount", bootCount);
         }
         boolean same(Event event) { return alarm.equals(event.alarm) && group == event.group; }
         String key() { return alarm + "/" + group + "/" + type + "/" + at; }
@@ -104,12 +113,23 @@ final class AlarmStore {
 
     AlarmStore(Context context) {
         prefs = context.getSharedPreferences("light_alarm", Context.MODE_PRIVATE);
+        bootCount = Settings.Global.getInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, 0);
         JSONObject root;
         try { root = new JSONObject(prefs.getString("state", "{}")); }
         catch (JSONException e) { throw new IllegalStateException("Could not read saved alarms", e); }
         for (JSONObject o : objects(root, "alarms")) alarms.add(Alarm.from(o));
         for (JSONObject o : objects(root, "pending")) pending.add(Event.from(o));
         for (JSONObject o : objects(root, "ringing")) ringing.add(Event.from(o));
+        // Upgrade active events saved by earlier versions to a bounded monotonic deadline.
+        for (int i = 0; i < ringing.size(); i++) {
+            Event event = ringing.get(i);
+            if (event.elapsedDeadline > 0) continue;
+            Alarm alarm = find(event.alarm);
+            long duration = (event.type == PRE ? 8 : alarm == null ? 120 : alarm.seconds) * 1000L;
+            long remaining = Math.max(0, Math.min(duration, event.deadline - System.currentTimeMillis()));
+            ringing.set(i, event.active(event.deadline, SystemClock.elapsedRealtime() + remaining,
+                    bootCount, event.snoozes, event.retried));
+        }
         for (JSONObject o : objects(root, "history"))
             history.add(new Log(o.optLong("at"), o.optString("label"), o.optString("action")));
     }
@@ -169,9 +189,13 @@ final class AlarmStore {
     }
 
     void tick(long now) {
+        tick(now, SystemClock.elapsedRealtime());
+    }
+
+    void tick(long now, long elapsedNow) {
         purge(now);
         for (Event ring : new ArrayList<>(ringing)) {
-            if (ring.deadline > now) continue;
+            if (ring.bootCount == bootCount && ring.elapsedDeadline > elapsedNow) continue;
             ringing.remove(ring);
             if (ring.type == PRE) continue;
             log(ring, "Missed", now);
@@ -209,7 +233,8 @@ final class AlarmStore {
                 pending.removeIf(x -> x.same(e) && (x.type == RETRY || x.type == SNOOZE));
             }
             ringing.removeIf(x -> x.same(e));
-            ringing.add(e.active(now + (e.type == PRE ? 8 : a.seconds) * 1000L, snoozes, retried));
+            long duration = (e.type == PRE ? 8 : a.seconds) * 1000L;
+            ringing.add(e.active(now + duration, elapsedNow + duration, bootCount, snoozes, retried));
             log(e, "Rang", now);
         }
     }

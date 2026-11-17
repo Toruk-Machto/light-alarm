@@ -2,6 +2,7 @@ package sg.lightalarm;
 
 import android.media.*;
 import android.os.*;
+import java.util.ArrayList;
 
 final class Tone implements AutoCloseable {
     static final String[] NAMES = {"Silent", "Soft bells", "Pulse", "Bright chime"};
@@ -62,11 +63,46 @@ final class Tone implements AutoCloseable {
     }
 
     static VibrationEffect pattern(int number, boolean repeat) {
-        long[] intervals = switch (number) {
+        return VibrationEffect.createWaveform(intervals(number), repeat ? 0 : -1);
+    }
+
+    private static long[] intervals(int number) {
+        return switch (number) {
             case 2 -> new long[]{0, 160, 100, 160, 650};
             case 3 -> new long[]{0, 240, 1000};
             default -> new long[]{0, 450, 450};
         };
-        return VibrationEffect.createWaveform(intervals, repeat ? 0 : -1);
+    }
+
+    static VibrationEffect timedPattern(int number, long elapsed, long duration) {
+        Waveform waveform = waveform(number, elapsed, duration);
+        return VibrationEffect.createWaveform(waveform.times(), waveform.levels(), -1);
+    }
+
+    record Waveform(long[] times, int[] levels) {}
+
+    static Waveform waveform(int number, long elapsed, long duration) {
+        long[] pattern = intervals(number);
+        ArrayList<Long> lengths = new ArrayList<>();
+        ArrayList<Integer> amplitudes = new ArrayList<>();
+        long position = 0;
+        int index = 0;
+        while (position < duration) {
+            long end = Math.min(duration, position + pattern[index]);
+            long length = end - Math.max(position, elapsed);
+            if (length > 0) {
+                lengths.add(length);
+                amplitudes.add(index % 2 == 0 ? 0 : VibrationEffect.DEFAULT_AMPLITUDE);
+            }
+            position = end;
+            index = (index + 1) % pattern.length;
+        }
+        long[] times = new long[lengths.size()];
+        int[] levels = new int[amplitudes.size()];
+        for (int i = 0; i < times.length; i++) {
+            times[i] = lengths.get(i);
+            levels[i] = amplitudes.get(i);
+        }
+        return new Waveform(times, levels);
     }
 }

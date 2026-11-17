@@ -25,3 +25,7 @@ Get the [signed APK from Releases](https://github.com/Toruk-Machto/light-alarm/r
 Light Alarm keeps alarms and reminders on the phone. The app excludes entries older than 24 hours from its history and has no Internet permission.
 
 ![Home](screenshots/home.png) ![Ringing](screenshots/ringing.png)
+
+## Battery update
+
+Version 0.1.2 preserves the alarm controls and grayscale interface while bounding ring duration across clock changes and releasing unnecessary CPU wake locks for silent reminders. See [BATTERY_UPDATE.md](BATTERY_UPDATE.md) for behavior and emulator verification.

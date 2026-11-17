@@ -61,7 +61,12 @@ public final class MainActivity extends Page {
         home();
     }
 
-    @Override protected void onResume() { super.onResume(); handler.removeCallbacks(refresh); refresh.run(); }
+    @Override protected void onResume() {
+        super.onResume();
+        AlarmReceiver.finishExpired(this, new AlarmStore(this));
+        handler.removeCallbacks(refresh);
+        refresh.run();
+    }
     @Override protected void onPause() { preview.close(); handler.removeCallbacksAndMessages(null); super.onPause(); }
 
     @Override public void onBackPressed() {

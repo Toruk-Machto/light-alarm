@@ -30,6 +30,7 @@ public final class RingActivity extends Page {
 
     private void update() {
         AlarmStore data = new AlarmStore(this);
+        AlarmReceiver.finishExpired(this, data);
         if (data.ringing.isEmpty()) { finish(); return; }
         ArrayList<AlarmStore.Event> events = new ArrayList<>(data.ringing);
         events.sort(Comparator.comparingInt((AlarmStore.Event e) -> e.type() == AlarmStore.PRE ? 1 : 0)

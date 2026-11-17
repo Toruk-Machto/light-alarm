@@ -3,6 +3,7 @@ package sg.lightalarm;
 import android.app.*;
 import android.content.*;
 import android.os.PowerManager;
+import android.os.SystemClock;
 
 public final class AlarmReceiver extends BroadcastReceiver {
     static final String FIRE = "sg.lightalarm.FIRE", EXPIRE = "sg.lightalarm.EXPIRE",
@@ -38,12 +39,12 @@ public final class AlarmReceiver extends BroadcastReceiver {
         mgr.cancel(prune);
         long at = Long.MAX_VALUE, end = Long.MAX_VALUE, oldest = Long.MAX_VALUE;
         for (AlarmStore.Event e : data.pending) at = Math.min(at, e.at());
-        for (AlarmStore.Event e : data.ringing) end = Math.min(end, e.deadline());
+        for (AlarmStore.Event e : data.ringing) end = Math.min(end, e.elapsedDeadline());
         for (AlarmStore.Log log : data.history) oldest = Math.min(oldest, log.at());
         if (mgr.canScheduleExactAlarms()) {
             if (at != Long.MAX_VALUE)
                 mgr.setAlarmClock(new AlarmManager.AlarmClockInfo(at, home(context)), fire);
-            if (end != Long.MAX_VALUE) mgr.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, end, expire);
+            if (end != Long.MAX_VALUE) mgr.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, end, expire);
         }
         if (oldest != Long.MAX_VALUE) mgr.set(AlarmManager.RTC, oldest + AlarmStore.DAY, prune);
     }
@@ -57,6 +58,15 @@ public final class AlarmReceiver extends BroadcastReceiver {
                 android.util.Log.w("LightAlarm", "Background update could not reopen the alarm service", blocked);
             }
         }
+    }
+
+    static void finishExpired(Context context, AlarmStore data) {
+        long elapsed = SystemClock.elapsedRealtime();
+        if (data.ringing.stream().noneMatch(e -> e.bootCount() != data.bootCount || e.elapsedDeadline() <= elapsed)) return;
+        data.tick(System.currentTimeMillis(), elapsed);
+        data.save();
+        schedule(context, data);
+        refresh(context, data);
     }
 
     static PendingIntent home(Context ctx) {

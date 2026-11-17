@@ -18,6 +18,9 @@ public final class AlarmService extends Service {
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         AlarmStore data = new AlarmStore(this);
+        data.tick(System.currentTimeMillis());
+        data.save();
+        AlarmReceiver.schedule(this, data);
         AlarmStore.Event event = data.ringing.stream().min(Comparator
                 .comparingInt((AlarmStore.Event e) -> e.type() == AlarmStore.PRE ? 1 : 0)
                 .thenComparingLong(AlarmStore.Event::at)).orElse(null);
@@ -38,19 +41,26 @@ public final class AlarmService extends Service {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
         if (changed) {
             playing = event.key();
+            long duration = (event.type() == AlarmStore.PRE ? 8 : alarm.seconds) * 1000L;
+            long elapsed = Math.max(0, duration - (event.elapsedDeadline() - SystemClock.elapsedRealtime()));
             tone.play(alarm.tone, event.type() == AlarmStore.PRE ? 14 : alarm.fade,
-                    System.currentTimeMillis() - event.at());
+                    elapsed);
             Vibrator vibrator = getSystemService(VibratorManager.class).getDefaultVibrator();
             vibrator.cancel();
-            if (alarm.vibration > 0 && event.type() != AlarmStore.PRE)
-                vibrator.vibrate(Tone.pattern(alarm.vibration, true),
+            if (alarm.vibration > 0 && event.type() != AlarmStore.PRE && elapsed < duration)
+                vibrator.vibrate(Tone.timedPattern(alarm.vibration, elapsed, duration),
                         new VibrationAttributes.Builder().setUsage(VibrationAttributes.USAGE_ALARM).build());
         }
-        long delay = data.ringing.stream().mapToLong(AlarmStore.Event::deadline).min()
-                .orElse(System.currentTimeMillis()) - System.currentTimeMillis();
+        long delay = data.ringing.stream().mapToLong(AlarmStore.Event::elapsedDeadline).min()
+                .orElse(SystemClock.elapsedRealtime()) - SystemClock.elapsedRealtime();
         if (wake == null) wake = AlarmReceiver.wake(this);
         if (wake.isHeld()) wake.release();
-        wake.acquire(Math.max(1000, delay + 5000));
+        // Audio needs the CPU, while the vibrator runs its finite waveform in the system.
+        boolean needsRetry = data.ringing.stream().anyMatch(e -> {
+            AlarmStore.Alarm owner = data.find(e.alarm());
+            return owner != null && owner.retry > 0 && !e.retried() && e.type() != AlarmStore.BACKUP;
+        });
+        if (alarm.tone > 0 || needsRetry) wake.acquire(Math.max(1000, delay + 5000));
         handler.removeCallbacksAndMessages(null);
         handler.postDelayed(() -> {
             AlarmStore live = new AlarmStore(this);
